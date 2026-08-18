@@ -1,6 +1,7 @@
 import itertools
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import unicodedata
 from collections import Counter
 from urllib.parse import quote_plus, urlparse
@@ -776,13 +777,11 @@ def bing_html_fallback(query, domain, max_results=8):
         return []
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def search_one_query(query, domain, max_results):
+@st.cache_data(ttl=1800, show_spinner=False)
+def search_one_query(query, domain, max_results, allow_fallback=False):
     rows = ddgs_search(query, domain, max_results)
-
-    if not rows:
-        rows = bing_html_fallback(query, domain, min(max_results, 10))
-
+    if not rows and allow_fallback:
+        rows = bing_html_fallback(query, domain, min(max_results, 8))
     return rows
 
 
@@ -978,7 +977,13 @@ with st.sidebar:
 
     results_per_query = st.slider(
         "Sorgu başına sonuç",
-        5, 25, 10, 5
+        5, 20, 8, 1
+    )
+
+    max_workers = st.slider(
+        "Paralel arama sayısı",
+        4, 16, 10, 1,
+        help="Daha yüksek değer aramayı hızlandırır; 8-12 arası önerilir."
     )
 
     fetch_full = st.checkbox(
@@ -1094,9 +1099,9 @@ if search_clicked:
 
     # Arama derinliğine göre sorgu sayısı
     plan_limit = {
-        "Hızlı": 8,
-        "Dengeli": 18,
-        "Derin": 35,
+        "Hızlı": 6,
+        "Dengeli": 14,
+        "Derin": 24,
     }[search_depth]
 
     plans = plans[:plan_limit]
@@ -1109,49 +1114,99 @@ if search_clicked:
     all_results = []
     source_stats = Counter()
 
-    total_steps = max(1, len(selected_sources) * len(plans))
-    done = 0
+    # HIZLI ARAMA MİMARİSİ
+    fast_plan_limit = {
+        "Hızlı": min(6, len(plans)),
+        "Dengeli": min(12, len(plans)),
+        "Derin": min(20, len(plans)),
+    }[search_depth]
+    primary_plans = plans[:fast_plan_limit]
 
+    tasks = []
+    for source_name in selected_sources:
+        domain = OFFICIAL_SOURCES[source_name]["domain"]
+        for plan in primary_plans:
+            tasks.append((source_name, domain, plan))
+
+    total_steps = max(1, len(tasks))
+    done = 0
     progress = st.progress(0)
     status = st.empty()
 
-    for source_name in selected_sources:
-        cfg = OFFICIAL_SOURCES[source_name]
+    def run_fast_search(source_name, domain, plan):
+        rows = search_one_query(
+            plan["query"], domain, results_per_query, allow_fallback=False
+        )
+        return source_name, plan, rows
 
-        source_found = 0
+    # Kaynak ve sorgular paralel çalışır.
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(run_fast_search, source_name, domain, plan):
+            (source_name, plan)
+            for source_name, domain, plan in tasks
+        }
 
-        for plan in plans:
+        for future in as_completed(future_map):
+            source_name, plan = future_map[future]
             done += 1
             progress.progress(min(done / total_steps, 1.0))
             status.caption(
-                f"{source_name} • {plan['level']} arama • "
+                f"{source_name} • {plan['level']} • "
                 f"{' + '.join(plan['terms'][:2])}"
             )
 
-            rows = search_one_query(
-                plan["query"],
-                cfg["domain"],
-                results_per_query,
-            )
+            try:
+                _, finished_plan, rows = future.result()
+            except Exception:
+                rows = []
+                finished_plan = plan
 
             for row in rows:
                 row["source"] = source_name
-                row["search_level"] = plan["level"]
-                row["trigger_terms"] = plan["terms"]
+                row["search_level"] = finished_plan["level"]
+                row["trigger_terms"] = finished_plan["terms"]
                 all_results.append(row)
-                source_found += 1
+                source_stats[source_name] += 1
 
-            # Aynı kaynaktan yeterince aday geldiyse gereksiz sorguyu azalt
-            if search_depth == "Hızlı" and source_found >= 20:
-                break
-            if search_depth == "Dengeli" and source_found >= 45:
-                break
-            if search_depth == "Derin" and source_found >= 90:
-                break
+    # Fallback sadece hiç sonuç veremeyen kaynaklarda ve en güçlü 3 sorguda çalışır.
+    missing_sources = [
+        name for name in selected_sources if source_stats[name] == 0
+    ]
+    fallback_plans = primary_plans[:3]
 
-            time.sleep(0.05)
+    if missing_sources and fallback_plans:
+        fallback_tasks = []
+        for source_name in missing_sources:
+            domain = OFFICIAL_SOURCES[source_name]["domain"]
+            for plan in fallback_plans:
+                fallback_tasks.append((source_name, domain, plan))
 
-        source_stats[source_name] = source_found
+        with ThreadPoolExecutor(max_workers=min(max_workers, 6)) as executor:
+            future_map = {
+                executor.submit(
+                    search_one_query,
+                    plan["query"],
+                    domain,
+                    min(results_per_query, 8),
+                    True,
+                ): (source_name, plan)
+                for source_name, domain, plan in fallback_tasks
+            }
+
+            for future in as_completed(future_map):
+                source_name, plan = future_map[future]
+                try:
+                    rows = future.result()
+                except Exception:
+                    rows = []
+
+                for row in rows:
+                    row["source"] = source_name
+                    row["search_level"] = f"{plan['level']}+"
+                    row["trigger_terms"] = plan["terms"]
+                    all_results.append(row)
+                    source_stats[source_name] += 1
 
     progress.empty()
     status.empty()

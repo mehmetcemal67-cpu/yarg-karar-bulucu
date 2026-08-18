@@ -495,6 +495,60 @@ def is_official(url):
     return any(cfg["domain"] in host for cfg in OFFICIAL_SOURCES.values())
 
 
+def is_direct_decision_url(url, source_name=""):
+    """
+    Yalnızca doğrudan bir karar/doküman sayfasına benzeyen resmî URL'leri kabul eder.
+    Kaynak ana sayfası, genel arama ekranı ve sonuç listeleri elenir.
+    """
+    if not url or not is_official(url):
+        return False
+
+    parsed = urlparse(url)
+    path = (parsed.path or "").lower().strip("/")
+    query = (parsed.query or "").lower()
+    full = url.lower()
+
+    # Ana sayfaları ve genel arama ekranlarını ele
+    if not path and not query:
+        return False
+
+    generic_bad = [
+        "search", "arama", "anasayfa", "index",
+        "default.aspx", "home"
+    ]
+
+    # Açıkça genel arama sayfası olup doküman kimliği taşımıyorsa kabul etme
+    if any(x in full for x in generic_bad):
+        id_tokens = ["id=", "kararid=", "documentid=", "dokumanid=", "docid="]
+        if not any(x in query for x in id_tokens):
+            return False
+
+    # Kuvvetli doğrudan-karar göstergeleri
+    strong_tokens = [
+        "getdokuman", "dokuman", "document",
+        "kararid=", "documentid=", "dokumanid=", "docid=",
+        "/bb/", "/kbb/", "/karar/", "/kararlar/"
+    ]
+    if any(x in full for x in strong_tokens):
+        return True
+
+    # URL içinde karar/emsal + sayısal kimlik varsa doğrudan sonuç olma ihtimali yüksek
+    if ("karar" in full or "emsal" in full) and re.search(r"\d{3,}", full):
+        return True
+
+    # Sorgu parametresinde doğrudan kayıt kimliği
+    if re.search(r"(?:^|&)(?:id|kararid|documentid|dokumanid|docid)=\d+", query):
+        return True
+
+    # AYM karar bilgi bankasında derin sayfaları kabul et
+    if "kararlarbilgibankasi.anayasa.gov.tr" in parsed.netloc.lower():
+        segments = [x for x in path.split("/") if x]
+        if len(segments) >= 2:
+            return True
+
+    return False
+
+
 def normalize_number(value):
     value = clean_text(value)
     value = re.sub(r"\b[EKek]\.?\s*[:\-]?\s*", "", value)
@@ -725,6 +779,9 @@ def ddgs_search(query, domain, max_results=10):
                     url = item.get("href") or item.get("url") or ""
                     if not url or domain not in urlparse(url).netloc.lower():
                         continue
+                    source_name = source_from_url(url)
+                    if not is_direct_decision_url(url, source_name):
+                        continue
                     rows.append({
                         "title": clean_text(item.get("title", "")),
                         "body": clean_text(item.get("body", "")),
@@ -759,6 +816,9 @@ def bing_html_fallback(query, domain, max_results=8):
 
             href = a.get("href", "")
             if domain not in urlparse(href).netloc.lower():
+                continue
+            source_name = source_from_url(href)
+            if not is_direct_decision_url(href, source_name):
                 continue
 
             p = item.select_one(".b_caption p")
@@ -1213,6 +1273,13 @@ if search_clicked:
 
     all_results = dedupe(all_results)
 
+    # Son savunma filtresi:
+    # Kullanıcıya yalnızca doğrudan karar/doküman bağlantısı göster.
+    all_results = [
+        row for row in all_results
+        if is_direct_decision_url(row.get("href", ""), row.get("source", ""))
+    ]
+
     for row in all_results:
         row["score"] = score_result(
             row,
@@ -1350,6 +1417,11 @@ if results:
             top2.metric("Kavram eşleşmesi", row["concept_count"])
             top3.write(f"**Tarama:** {row.get('search_level', '')}")
 
+            # Başlığın kendisi doğrudan karar bağlantısıdır.
+            st.markdown(
+                f"### [{title}]({row['href']})"
+            )
+
             if row.get("body"):
                 st.write(row["body"])
 
@@ -1366,11 +1438,14 @@ if results:
                 )
 
             st.link_button(
-                "⚖️ Kararı resmî kaynaktan aç",
-                row["href"]
+                "⚖️ Kararı Aç",
+                row["href"],
+                use_container_width=True,
             )
 
-            st.caption(f"Resmî bağlantı: {row['href']}")
+            st.caption(
+                "Bu bağlantı genel arama ekranına değil, bulunan doğrudan resmî karar/doküman sayfasına gider."
+            )
 
             if fetch_full:
                 with st.spinner("Karar metni inceleniyor…"):
@@ -1397,7 +1472,8 @@ if results:
 
 elif "last_results" in st.session_state:
     st.warning(
-        "Bu taramada doğrudan karar sonucu bulunamadı. "
+        "Bu taramada doğrudan açılabilen resmî karar bağlantısı bulunamadı. "
+        "Genel arama ve yönlendirme sayfaları özellikle listeden çıkarılmıştır. "
         "Bu durum mutlaka karar olmadığı anlamına gelmez. "
         "Arama Derinliği'ni 'Derin' seçebilir, tarih/daire kısıtlarını kaldırabilir "
         "veya konuyu daha doğal bir cümleyle yazabilirsin."

@@ -1,183 +1,495 @@
-import re
-import streamlit as st
 
-# Sayfa Genişliği ve Başlık Ayarı
+import io
+import re
+import html
+import json
+from urllib.parse import quote
+
+import requests
+import streamlit as st
+from bs4 import BeautifulSoup
+from docx import Document
+from docx.shared import Pt
+
+
 st.set_page_config(
-    page_title="Yargıtay Karar Arama Portal",
+    page_title="Yargıtay Ceza Karar Arama",
     page_icon="⚖️",
     layout="wide",
-    initial_sidebar_state="collapsed",
 )
 
-# Arayüz Stillemesi (Özel CSS - Görsele Uygun Renkler)
-st.markdown(
+BASE = "https://karararama.yargitay.gov.tr"
+SEARCH_URL = f"{BASE}/aramadetaylist"
+DOC_URL = f"{BASE}/getDokuman?id={{}}"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json;charset=UTF-8",
+    "Origin": BASE,
+    "Referer": BASE + "/",
+    "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.7",
+}
+
+
+@st.cache_resource
+def get_session():
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+
+def clean(v):
+    return re.sub(r"\s+", " ", str(v or "")).strip()
+
+
+def build_payload(
+    term,
+    page,
+    chamber="",
+    start_date="",
+    end_date="",
+    esas_year="",
+    esas_first="",
+    esas_last="",
+    karar_year="",
+    karar_first="",
+    karar_last="",
+):
+    # Yargıtay arayüzünde fiilen kullanılan sayfa boyutu 10'dur.
+    # Tek, sade istek: önceki sürümdeki 3 payload denemesini kaldırdık.
+    data = {
+        "arananKelime": term,
+        "birimYrgKurulDaire": chamber,
+        "esasYil": esas_year,
+        "esasIlkSiraNo": esas_first,
+        "esasSonSiraNo": esas_last,
+        "kararYil": karar_year,
+        "kararIlkSiraNo": karar_first,
+        "kararSonSiraNo": karar_last,
+        "baslangicTarihi": start_date,
+        "bitisTarihi": end_date,
+        "siralama": "3",
+        "siralamaDirection": "desc",
+        "pageSize": 10,
+        "pageNumber": page,
+    }
+
+    # Boş alanları gereksiz yere göndermemek isteği hafifletir.
+    data = {k: v for k, v in data.items() if v not in ("", None)}
+    return {"data": data}
+
+
+def normalize_decision(row):
+    return {
+        "id": clean(row.get("id")),
+        "daire": clean(row.get("daire")),
+        "esas": clean(row.get("esasNo")),
+        "karar": clean(row.get("kararNo")),
+        "tarih": clean(row.get("kararTarihi")),
+    }
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def search_yargitay(
+    term,
+    page,
+    chamber,
+    start_date,
+    end_date,
+    esas_year,
+    esas_first,
+    esas_last,
+    karar_year,
+    karar_first,
+    karar_last,
+):
+    payload = build_payload(
+        term,
+        page,
+        chamber,
+        start_date,
+        end_date,
+        esas_year,
+        esas_first,
+        esas_last,
+        karar_year,
+        karar_first,
+        karar_last,
+    )
+
+    try:
+        r = get_session().post(
+            SEARCH_URL,
+            json=payload,
+            timeout=(5, 15),
+        )
+        r.raise_for_status()
+        obj = r.json()
+
+        # Beklenen yapı: data.data = kararlar, data.recordsTotal = toplam
+        block = obj.get("data") or {}
+        rows_raw = block.get("data") or []
+        total = block.get("recordsTotal") or 0
+
+        rows = [normalize_decision(x) for x in rows_raw if isinstance(x, dict)]
+
+        return {
+            "ok": True,
+            "rows": rows,
+            "total": int(total or 0),
+            "error": "",
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "rows": [],
+            "total": 0,
+            "error": str(e),
+        }
+
+
+def extract_document_payload(raw_text):
     """
-    <style>
-    /* Üst Banner Stili */
-    .header-bar {
-        background-color: #38b2ac;
-        padding: 12px 20px;
-        border-radius: 6px;
-        color: white;
-        font-weight: bold;
-        font-size: 20px;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        margin-bottom: 20px;
+    getDokuman cevabında karar metni XML/HTML içinde veya escape edilmiş
+    HTML olarak gelebilir. En uzun anlamlı içerik bloğunu seçer.
+    """
+    raw_text = html.unescape(raw_text or "")
+
+    # 1) XML/HTML parser ile aday alanları dene
+    soup = BeautifulSoup(raw_text, "html.parser")
+
+    candidates = []
+
+    for tag in soup.find_all(True):
+        txt = tag.get_text("\n", strip=True)
+        if len(txt) > 500:
+            candidates.append(txt)
+
+    # 2) Tüm sayfa metni
+    whole = soup.get_text("\n", strip=True)
+    if len(whole) > 500:
+        candidates.append(whole)
+
+    # 3) Escape edilmiş HTML varsa ikinci kez çöz
+    decoded = html.unescape(whole)
+    if "<" in decoded and ">" in decoded:
+        soup2 = BeautifulSoup(decoded, "html.parser")
+        txt2 = soup2.get_text("\n", strip=True)
+        if len(txt2) > 500:
+            candidates.append(txt2)
+
+    if not candidates:
+        # Son çare: tagleri kaldır
+        plain = re.sub(r"<br\s*/?>", "\n", raw_text, flags=re.I)
+        plain = re.sub(r"<[^>]+>", "", plain)
+        plain = html.unescape(plain)
+        candidates.append(plain)
+
+    # Genellikle en uzun blok karar metnidir.
+    text = max(candidates, key=len)
+
+    lines = []
+    junk = {
+        "SUCCESS",
+        "ADALET_SUCCESS",
+        "İşlem başarıyla gerçekleştirildi!",
     }
-    /* Metin Vurgulama Stili */
-    mark {
-        background-color: #fef08a;
-        color: #000000;
-        padding: 2px 4px;
-        border-radius: 3px;
-        font-weight: bold;
-    }
-    /* Tablo Alanı */
-    .stDataFrame {
-        border-radius: 8px;
-    }
-    </style>
-""",
-    unsafe_allow_html=True,
+
+    for line in text.splitlines():
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if not line or line in junk:
+            continue
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_decision_text(decision_id):
+    if not decision_id:
+        return ""
+
+    try:
+        r = get_session().get(
+            DOC_URL.format(quote(str(decision_id), safe="")),
+            timeout=(5, 20),
+        )
+        r.raise_for_status()
+        return extract_document_payload(r.text)[:500000]
+    except Exception:
+        return ""
+
+
+def make_word(text, row):
+    doc = Document()
+
+    style = doc.styles["Normal"]
+    style.font.name = "Arial"
+    style.font.size = Pt(11)
+
+    doc.add_heading("Yargıtay Kararı", level=1)
+
+    doc.add_paragraph(f"Daire/Kurul: {row.get('daire') or '-'}")
+    doc.add_paragraph(f"Esas No: {row.get('esas') or '-'}")
+    doc.add_paragraph(f"Karar No: {row.get('karar') or '-'}")
+    doc.add_paragraph(f"Karar Tarihi: {row.get('tarih') or '-'}")
+    doc.add_paragraph(
+        f"Resmî Kaynak: {DOC_URL.format(row.get('id') or '')}"
+    )
+
+    doc.add_heading("Karar Metni", level=2)
+
+    for para in re.split(r"\n{2,}", text):
+        para = para.strip()
+        if para:
+            doc.add_paragraph(para)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def safe_filename(row):
+    e = (row.get("esas") or "esas").replace("/", "_")
+    k = (row.get("karar") or "karar").replace("/", "_")
+    return f"Yargitay_E_{e}_K_{k}.docx"
+
+
+# ------------------------------------------------------------
+# UI
+# ------------------------------------------------------------
+
+st.title("⚖️ Yargıtay Ceza Karar Arama")
+st.caption(
+    "Hızlı sayfalama, anlık karar önizleme ve Word indirme."
 )
 
-# Üst Başlık Banner
-st.markdown(
-    '<div class="header-bar">⚖️ Yargıtay Karar Arama</div>',
-    unsafe_allow_html=True,
+term = st.text_input(
+    "Aranacak kelime / ifade",
+    placeholder='Örn: haksız tahrik   veya   "haksız tahrik"',
 )
 
+with st.expander("Detaylı Arama", expanded=False):
+    c1, c2 = st.columns(2)
 
-# Örnek Veri Seti (İleride burayı bir veritabanı, CSV veya API çağrısına bağlayabilirsiniz)
-@st.cache_data
-def load_data():
-    return [
-        {
-            "id": 1,
-            "daire": "Ceza Genel Kurulu",
-            "esas": "2021/179",
-            "karar": "2023/229",
-            "tarih": "25.04.2023",
-            "metin": """Ceza Genel Kurulu 2021/179 E. , 2023/229 K.\n\n"İçtihat Metni"\nMAHKEMESİ : Asliye Ceza Mahkemesi\nSUÇ : Hakaret\nHÜKÜM : Ceza verilmesine yer olmadığı\n\nKARAR:\nSanık hakkında haksız tahrik altında işlenen fiil neticesinde ceza verilmesine yer olmadığı kararı temyiz edilmiştir. İnceleme neticesinde haksız tahrik unsurlarının oluştuğu sabittir.""",
-        },
-        {
-            "id": 2,
-            "daire": "18. Ceza Dairesi",
-            "esas": "2016/9638",
-            "karar": "2018/6863",
-            "tarih": "07.05.2018",
-            "metin": """18. Ceza Dairesi 2016/9638 E. , 2018/6863 K.\n\n"İçtihat Metni"\nMAHKEMESİ : Asliye Ceza Mahkemesi\nSUÇ : Hakaret\nHÜKÜM : Ceza verilmesine yer olmadığı\n\nKARAR:\nYerel Mahkemece verilen hüküm temyiz edilmekle, başvurunun süresi, kararın niteliği ile suç tarihine göre dosya görüşüldü:\nTemyiz isteğinin reddi nedenleri bulunmadığından işin esasına geçildi.\nHakaret suçunun haksız fiile tepki olarak işlenmesi nedeniyle ceza verilmesine yer olmadığı kararına yönelik Cumhuriyet Savcısının temyiz iddiaları yerinde görülmediğinden HÜKMÜN ONANMASINA oy çokluğuyla karar verildi.\n\nKARŞI OY:\nSayın çoğunluk ile aramızdaki uyuşmazlık sanık hakkında haksız tahrik hükümlerinin uygulanıp uygulanmayacağı noktasındadır. TCK 29. maddesinde haksız tahrik "Haksız bir fiilin meydana getirdiği şiddet veya şiddetli elemin etkisi altında suç işleyen kimseye..." şeklinde düzenlenmiştir.""",
-        },
-        {
-            "id": 3,
-            "daire": "1. Ceza Dairesi",
-            "esas": "2025/1857",
-            "karar": "2025/5064",
-            "tarih": "24.06.2025",
-            "metin": """1. Ceza Dairesi 2025/1857 E. , 2025/5064 K.\n\n"İçtihat Metni"\nMeşru müdafaa ve haksız tahrik dengesi kurulurken olayın gelişimi ve haksız eylemin ulaştığı boyut göz önüne alınmalıdır.""",
-        },
-        {
-            "id": 4,
-            "daire": "14. Ceza Dairesi",
-            "esas": "2018/6721",
-            "karar": "2018/8399",
-            "tarih": "01.11.2018",
-            "metin": """14. Ceza Dairesi 2018/6721 E. , 2018/8399 K.\n\nCinsel dokunulmazlığa karşı suçlarda mağdur beyanı ve delillerin değerlendirilmesi.""",
-        },
-    ]
+    with c1:
+        chamber = st.text_input(
+            "Ceza Dairesi / Kurul",
+            placeholder="Örn: 1. Ceza Dairesi",
+        )
+        start_date = st.text_input(
+            "Başlangıç tarihi",
+            placeholder="GG.AA.YYYY",
+        )
+        esas_year = st.text_input("Esas yılı", placeholder="2024")
+        esas_first = st.text_input("Esas ilk sıra no")
+        esas_last = st.text_input("Esas son sıra no")
+
+    with c2:
+        end_date = st.text_input(
+            "Bitiş tarihi",
+            placeholder="GG.AA.YYYY",
+        )
+        karar_year = st.text_input("Karar yılı", placeholder="2025")
+        karar_first = st.text_input("Karar ilk sıra no")
+        karar_last = st.text_input("Karar son sıra no")
 
 
-kararlar = load_data()
+if "page" not in st.session_state:
+    st.session_state.page = 1
 
-# Arama Çubuğu Formu
-with st.form("search_form"):
-    col_input, col_btn = st.columns([5, 1])
-    with col_input:
-        query = st.text_input(
-            "Arama Kelimesi",
-            value="haksız tahrik",
-            placeholder="Aramak istediğiniz kavramı yazın (Ör: haksız tahrik)",
+if "active_search" not in st.session_state:
+    st.session_state.active_search = None
+
+if st.button("🔎 Ara", type="primary", use_container_width=True):
+    st.session_state.page = 1
+    st.session_state.active_search = {
+        "term": term,
+        "chamber": chamber,
+        "start_date": start_date,
+        "end_date": end_date,
+        "esas_year": esas_year,
+        "esas_first": esas_first,
+        "esas_last": esas_last,
+        "karar_year": karar_year,
+        "karar_first": karar_first,
+        "karar_last": karar_last,
+    }
+    st.session_state.selected_id = None
+    st.rerun()
+
+
+active = st.session_state.active_search
+
+if active:
+    with st.spinner("Yargıtay aranıyor…"):
+        result = search_yargitay(
+            active["term"],
+            st.session_state.page,
+            active["chamber"],
+            active["start_date"],
+            active["end_date"],
+            active["esas_year"],
+            active["esas_first"],
+            active["esas_last"],
+            active["karar_year"],
+            active["karar_first"],
+            active["karar_last"],
+        )
+
+    if not result["ok"]:
+        st.error("Yargıtay arama servisine erişilemedi.")
+        with st.expander("Teknik ayrıntı"):
+            st.code(result["error"])
+        st.stop()
+
+    rows = result["rows"]
+    total = result["total"]
+    total_pages = max(1, (total + 9) // 10)
+
+    st.success(f"{total:,} adet karar bulundu.".replace(",", "."))
+
+    # İlk karar otomatik önizlenir.
+    if rows and not st.session_state.get("selected_id"):
+        st.session_state.selected_id = rows[0]["id"]
+
+    nav1, nav2, nav3 = st.columns([1, 2, 1])
+
+    with nav1:
+        if st.button(
+            "◀ Önceki",
+            disabled=st.session_state.page <= 1,
+            use_container_width=True,
+        ):
+            st.session_state.page -= 1
+            st.session_state.selected_id = None
+            st.rerun()
+
+    with nav2:
+        page_choice = st.number_input(
+            "Sayfa",
+            min_value=1,
+            max_value=total_pages,
+            value=min(st.session_state.page, total_pages),
+            step=1,
             label_visibility="collapsed",
         )
-    with col_btn:
-        submitted = st.form_submit_button(
-            "Ara", use_container_width=True, type="primary"
+        if int(page_choice) != st.session_state.page:
+            st.session_state.page = int(page_choice)
+            st.session_state.selected_id = None
+            st.rerun()
+
+        st.caption(
+            f"Sayfa {st.session_state.page:,} / {total_pages:,}".replace(",", ".")
         )
 
-# Arama Mantığı ve Sonuçları Filtreleme
-filtered_kararlar = []
-if query.strip():
-    words = [w.strip() for w in query.split() if w.strip()]
-    for k in kararlar:
-        # Aranan kelimelerin metinde geçip geçmediğini kontrol et
-        metin_lower = k["metin"].lower()
-        if all(word.lower() in metin_lower for word in words):
-            filtered_kararlar.append(k)
+    with nav3:
+        if st.button(
+            "Sonraki ▶",
+            disabled=st.session_state.page >= total_pages,
+            use_container_width=True,
+        ):
+            st.session_state.page += 1
+            st.session_state.selected_id = None
+            st.rerun()
 
-# İki Sütunlu Düzen (Sol: Liste / Sağ: Detay)
-col_left, col_right = st.columns([5, 7])
+    left, right = st.columns([0.47, 0.53], gap="large")
 
-with col_left:
-    st.info(f"**{len(filtered_kararlar)}** adet karar bulundu.")
+    with left:
+        st.markdown("### Karar Listesi")
 
-    if filtered_kararlar:
-        # Tablo Verisini Hazırla
-        table_data = [
-            {
-                "Sıra No": idx + 1,
-                "Daire": k["daire"],
-                "Esas": k["esas"],
-                "Karar": k["karar"],
-                "Karar Tarihi": k["tarih"],
-            }
-            for idx, k in enumerate(filtered_kararlar)
-        ]
+        if not rows:
+            st.info("Bu sayfada kayıt bulunamadı.")
 
-        # Tıklanabilir Seçim Kutusu
-        options = [
-            f"{k['daire']} | Esas: {k['esas']} - Karar: {k['karar']} ({k['tarih']})"
-            for k in filtered_kararlar
-        ]
-        selected_option = st.radio(
-            "İncelemek istediğiniz kararı seçin:",
-            options=options,
-            index=0,
-            label_visibility="collapsed",
+        for i, row in enumerate(rows, 1):
+            selected = row["id"] == st.session_state.get("selected_id")
+
+            with st.container(border=True):
+                st.markdown(
+                    f"**{row['daire'] or 'Yargıtay'}**  \n"
+                    f"E. **{row['esas'] or '—'}** · "
+                    f"K. **{row['karar'] or '—'}** · "
+                    f"{row['tarih'] or '—'}"
+                )
+
+                label = "✓ Açık" if selected else "Önizle / Aç"
+
+                if st.button(
+                    label,
+                    key=f"row_{st.session_state.page}_{i}_{row['id']}",
+                    use_container_width=True,
+                    disabled=not bool(row["id"]),
+                ):
+                    st.session_state.selected_id = row["id"]
+                    st.rerun()
+
+    with right:
+        st.markdown("### Karar Önizleme")
+
+        selected_row = next(
+            (x for x in rows if x["id"] == st.session_state.get("selected_id")),
+            rows[0] if rows else None,
         )
 
-        # Seçilen kararın indeksini bul
-        selected_idx = options.index(selected_option)
-        selected_karar = filtered_kararlar[selected_idx]
-    else:
-        st.warning("Aramanıza uygun karar bulunamadı.")
-        selected_karar = None
+        if not selected_row:
+            st.info("Soldaki listeden bir karar seç.")
+        else:
+            with st.spinner("Karar metni yükleniyor…"):
+                text = get_decision_text(selected_row["id"])
 
-with col_right:
-    if selected_karar:
-        # Başlık Bilgileri ve Butonlar
-        st.markdown(
-            f"### {selected_karar['daire']} — {selected_karar['esas']} E. , {selected_karar['karar']} K."
-        )
+            if not text:
+                st.warning(
+                    "Karar kaydı bulundu ancak metin bu istekte alınamadı. "
+                    "Aynı karara tekrar tıklamak veya kısa süre sonra yeniden denemek gerekebilir."
+                )
+            else:
+                st.markdown(
+                    f"**{selected_row['daire'] or ''}**  \n"
+                    f"E. {selected_row['esas'] or '—'} · "
+                    f"K. {selected_row['karar'] or '—'} · "
+                    f"{selected_row['tarih'] or '—'}"
+                )
 
-        # Karar metninde aranan kelimeleri vurgulama (Highlight)
-        text_to_display = selected_karar["metin"]
-        if query.strip():
-            words = [
-                re.escape(w.strip()) for w in query.split() if w.strip()
-            ]
-            pattern = re.compile(
-                r"(" + "|".join(words) + r")", re.IGNORECASE
-            )
-            text_to_display = pattern.sub(r"<mark>\1</mark>", text_to_display)
+                # Önizleme hemen görünür; tam metin aynı kutuda kopyalanabilir.
+                st.text_area(
+                    "Karar metni",
+                    value=text,
+                    height=620,
+                    key=f"text_{selected_row['id']}",
+                    help="Kutunun içine tıklayıp Ctrl+A → Ctrl+C ile tamamını kopyalayabilirsin.",
+                )
 
-        # Karar Metnini Göster (HTML destekli)
-        st.markdown(
-            f"""
-            <div style="background-color: #ffffff; padding: 20px; border-radius: 8px; border: 1px solid #e2e8f0; height: 550px; overflow-y: auto; white-space: pre-wrap; font-family: sans-serif; line-height: 1.6; color: #1a202c;">
-{text_to_display}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+                word_bytes = make_word(text, selected_row)
+
+                d1, d2 = st.columns(2)
+
+                with d1:
+                    st.download_button(
+                        "⬇️ Word İndir",
+                        data=word_bytes,
+                        file_name=safe_filename(selected_row),
+                        mime=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "wordprocessingml.document"
+                        ),
+                        use_container_width=True,
+                    )
+
+                with d2:
+                    st.download_button(
+                        "⬇️ TXT İndir",
+                        data=text.encode("utf-8"),
+                        file_name="yargitay_karari.txt",
+                        mime="text/plain",
+                        use_container_width=True,
+                    )
+
+                st.caption(
+                    "Karar ayrı sayfaya yönlendirilmez; metin bu panelde açılır."
+                )

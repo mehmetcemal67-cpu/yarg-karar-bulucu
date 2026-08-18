@@ -15,7 +15,7 @@ from docx.shared import Pt
 
 
 # ============================================================
-# AYARLAR
+# SAYFA AYARLARI
 # ============================================================
 
 st.set_page_config(
@@ -33,7 +33,6 @@ SOURCES = {
             "getDokuman?id={id}&arananKelime={term}"
         ),
     },
-
     "UYAP Emsal": {
         "base": "https://emsal.uyap.gov.tr",
         "search": "https://emsal.uyap.gov.tr/aramadetaylist",
@@ -43,7 +42,6 @@ SOURCES = {
         ),
     },
 }
-
 
 HEADERS = {
     "User-Agent": (
@@ -57,11 +55,11 @@ HEADERS = {
 
 
 # ============================================================
-# SESSION / BAĞLANTI
+# RUNTIME STATE
 # ============================================================
 
 @st.cache_resource
-def runtime():
+def runtime_state():
     return {
         "sessions": {},
         "locks": {
@@ -76,51 +74,40 @@ def runtime():
     }
 
 
-def session_for(source):
-    rt = runtime()
+def get_session(source):
+    state = runtime_state()
 
-    if source not in rt["sessions"]:
+    if source not in state["sessions"]:
         cfg = SOURCES[source]
 
-        s = requests.Session()
-
-        s.headers.update({
+        session = requests.Session()
+        session.headers.update({
             **HEADERS,
             "Content-Type": "application/json;charset=UTF-8",
             "Origin": cfg["base"],
             "Referer": cfg["base"] + "/",
         })
 
-        rt["sessions"][source] = s
+        state["sessions"][source] = session
 
-    return rt["sessions"][source]
+    return state["sessions"][source]
 
 
 def request_source(source, method, url, **kwargs):
-    """
-    Aynı resmî kaynağa aşırı hızlı ardışık istek göndermez.
-    Yargıtay ve UYAP birbirinden bağımsız çalışır.
-    """
-
-    rt = runtime()
-    lock = rt["locks"][source]
+    state = runtime_state()
+    lock = state["locks"][source]
 
     with lock:
+        elapsed = time.monotonic() - state["last_request"][source]
 
-        elapsed = time.monotonic() - rt["last_request"][source]
-
-        # Aşırı istek nedeniyle bloklanmayı azaltır.
         if elapsed < 1.2:
             time.sleep(1.2 - elapsed)
 
-        session = session_for(source)
-
+        session = get_session(source)
         last_error = None
 
         for attempt in range(2):
-
             try:
-
                 response = session.request(
                     method,
                     url,
@@ -128,20 +115,16 @@ def request_source(source, method, url, **kwargs):
                     **kwargs,
                 )
 
-                rt["last_request"][source] = time.monotonic()
+                state["last_request"][source] = time.monotonic()
 
-                if response.status_code == 429:
-
-                    if attempt == 0:
-                        time.sleep(6)
-                        continue
+                if response.status_code == 429 and attempt == 0:
+                    time.sleep(6)
+                    continue
 
                 response.raise_for_status()
-
                 return response
 
             except Exception as exc:
-
                 last_error = exc
 
                 if attempt == 0:
@@ -151,38 +134,39 @@ def request_source(source, method, url, **kwargs):
 
 
 # ============================================================
-# GENEL YARDIMCI FONKSİYONLAR
+# YARDIMCILAR
 # ============================================================
 
 def clean(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
-    return re.sub(
-        r"\s+",
-        " ",
-        str(value or "")
-    ).strip()
+
+def parse_number(value):
+    try:
+        return int(
+            str(value)
+            .replace(".", "")
+            .replace(",", "")
+            .strip()
+        )
+    except Exception:
+        return None
 
 
 def pick(data, *keys):
-
     if not isinstance(data, dict):
         return ""
 
-    lower = {
+    lowered = {
         str(k).lower(): v
         for k, v in data.items()
     }
 
     for key in keys:
+        if key in data and data[key] not in (None, ""):
+            return data[key]
 
-        if key in data:
-
-            value = data[key]
-
-            if value not in (None, ""):
-                return value
-
-        value = lower.get(str(key).lower())
+        value = lowered.get(str(key).lower())
 
         if value not in (None, ""):
             return value
@@ -190,27 +174,11 @@ def pick(data, *keys):
     return ""
 
 
-def parse_number(value):
-
-    try:
-
-        return int(
-            str(value)
-            .replace(".", "")
-            .replace(",", "")
-        )
-
-    except Exception:
-
-        return None
-
-
 # ============================================================
-# JSON CEVABINDAN KARARLARI BUL
+# JSON KARAR LİSTESİ BULMA
 # ============================================================
 
 def looks_like_decision(row):
-
     if not isinstance(row, dict):
         return False
 
@@ -220,8 +188,8 @@ def looks_like_decision(row):
     )
 
     return any(
-        word in keys
-        for word in [
+        token in keys
+        for token in [
             "esas",
             "karar",
             "daire",
@@ -234,36 +202,24 @@ def looks_like_decision(row):
 
 
 def recursive_lists(obj):
-
-    lists = []
+    found = []
 
     if isinstance(obj, list):
-
-        if obj and all(
-            isinstance(x, dict)
-            for x in obj
-        ):
-            lists.append(obj)
+        if obj and all(isinstance(x, dict) for x in obj):
+            found.append(obj)
 
         for item in obj:
-            lists.extend(
-                recursive_lists(item)
-            )
+            found.extend(recursive_lists(item))
 
     elif isinstance(obj, dict):
-
         for value in obj.values():
-            lists.extend(
-                recursive_lists(value)
-            )
+            found.extend(recursive_lists(value))
 
-    return lists
+    return found
 
 
 def find_rows(obj):
-
-    # Önce en sık kullanılan yapı.
-    paths = [
+    common_paths = [
         ("data", "data"),
         ("data", "content"),
         ("data", "rows"),
@@ -274,51 +230,35 @@ def find_rows(obj):
         ("result",),
     ]
 
-    for path in paths:
-
+    for path in common_paths:
         current = obj
-
         valid = True
 
         for key in path:
-
-            if (
-                not isinstance(current, dict)
-                or key not in current
-            ):
+            if not isinstance(current, dict) or key not in current:
                 valid = False
                 break
 
             current = current[key]
 
-        if (
-            valid
-            and isinstance(current, list)
-        ):
-
-            if (
-                not current
-                or any(
-                    looks_like_decision(x)
-                    for x in current
-                )
+        if valid and isinstance(current, list):
+            if not current or any(
+                looks_like_decision(x)
+                for x in current
             ):
                 return current
 
-    # Cevap şeması değişirse otomatik bul.
     candidates = recursive_lists(obj)
 
     candidates.sort(
         key=lambda lst: sum(
-            1
-            for row in lst
+            1 for row in lst
             if looks_like_decision(row)
         ),
         reverse=True,
     )
 
     for candidate in candidates:
-
         if any(
             looks_like_decision(row)
             for row in candidate
@@ -329,7 +269,6 @@ def find_rows(obj):
 
 
 def find_total(obj):
-
     total_keys = [
         "recordsTotal",
         "totalCount",
@@ -338,38 +277,30 @@ def find_total(obj):
         "toplamKayıt",
         "toplam",
         "total",
+        "count",
     ]
 
     def walk(value):
-
         if isinstance(value, dict):
-
             for key in total_keys:
-
                 if key in value:
-
-                    number = parse_number(
-                        value[key]
-                    )
+                    number = parse_number(value[key])
 
                     if number is not None:
                         return number
 
             for child in value.values():
+                number = walk(child)
 
-                result = walk(child)
-
-                if result is not None:
-                    return result
+                if number is not None:
+                    return number
 
         elif isinstance(value, list):
-
             for child in value:
+                number = walk(child)
 
-                result = walk(child)
-
-                if result is not None:
-                    return result
+                if number is not None:
+                    return number
 
         return None
 
@@ -377,11 +308,10 @@ def find_total(obj):
 
 
 # ============================================================
-# KARAR KAYDINI STANDARTLAŞTIR
+# KARAR KAYDI NORMALİZASYONU
 # ============================================================
 
 def normalize_row(row):
-
     decision_id = pick(
         row,
         "id",
@@ -432,40 +362,38 @@ def normalize_row(row):
     )
 
     if not esas:
-
-        year = pick(
+        esas_yil = pick(
             row,
             "esasYil",
             "esasYili",
             "esasYılı",
         )
 
-        number = pick(
+        esas_sira = pick(
             row,
             "esasSiraNo",
             "esasSıraNo",
         )
 
-        if year and number:
-            esas = f"{year}/{number}"
+        if esas_yil and esas_sira:
+            esas = f"{esas_yil}/{esas_sira}"
 
     if not karar:
-
-        year = pick(
+        karar_yil = pick(
             row,
             "kararYil",
             "kararYili",
             "kararYılı",
         )
 
-        number = pick(
+        karar_sira = pick(
             row,
             "kararSiraNo",
             "kararSıraNo",
         )
 
-        if year and number:
-            karar = f"{year}/{number}"
+        if karar_yil and karar_sira:
+            karar = f"{karar_yil}/{karar_sira}"
 
     return {
         "id": clean(decision_id),
@@ -480,7 +408,7 @@ def normalize_row(row):
 # ARAMA PAYLOAD
 # ============================================================
 
-def base_search_data(
+def build_search_data(
     query,
     chamber="",
     start_date="",
@@ -492,23 +420,17 @@ def base_search_data(
     karar_first="",
     karar_last="",
 ):
-
     data = {
         "arananKelime": query,
-
         "birimYrgKurulDaire": chamber,
-
         "esasYil": esas_year,
         "esasIlkSiraNo": esas_first,
         "esasSonSiraNo": esas_last,
-
         "kararYil": karar_year,
         "kararIlkSiraNo": karar_first,
         "kararSonSiraNo": karar_last,
-
         "baslangicTarihi": start_date,
         "bitisTarihi": end_date,
-
         "siralama": "3",
         "siralamaDirection": "desc",
     }
@@ -516,26 +438,12 @@ def base_search_data(
     return {
         key: value
         for key, value in data.items()
-        if value not in (
-            "",
-            None,
-            "ALL",
-        )
+        if value not in ("", None, "ALL")
     }
 
 
-def payload_variants(
-    data,
-    page,
-    page_size,
-):
-
-    # Yargıtay / UYAP servis sürümlerine göre
-    # sayfalama konumu değişebildiği için
-    # üç uyumlu yapı desteklenir.
-
+def payload_variants(data, page, page_size):
     return {
-
         1: {
             "data": data,
             "pageSize": page_size,
@@ -559,9 +467,7 @@ def payload_variants(
 
 
 def valid_response(obj):
-
     rows = find_rows(obj)
-
     total = find_total(obj)
 
     if total is not None:
@@ -576,8 +482,8 @@ def valid_response(obj):
     ).lower()
 
     return any(
-        key in text
-        for key in [
+        token in text
+        for token in [
             "success",
             "adalet_success",
             "recordstotal",
@@ -588,7 +494,7 @@ def valid_response(obj):
 
 
 # ============================================================
-# RESMÎ KAYNAKTA ARAMA
+# RESMÎ KAYNAK ARAMA
 # ============================================================
 
 @st.cache_data(
@@ -610,10 +516,9 @@ def search_source(
     karar_first,
     karar_last,
 ):
-
     cfg = SOURCES[source]
 
-    data = base_search_data(
+    data = build_search_data(
         query,
         chamber,
         start_date,
@@ -632,30 +537,22 @@ def search_source(
         page_size,
     )
 
-    rt = runtime()
-
-    known_schema = rt["schema"].get(
-        source
-    )
+    state = runtime_state()
+    known_schema = state["schema"].get(source)
 
     order = []
 
     if known_schema:
-        order.append(
-            known_schema
-        )
+        order.append(known_schema)
 
     for schema in [1, 2, 3]:
-
         if schema not in order:
             order.append(schema)
 
     errors = []
 
     for schema in order:
-
         try:
-
             response = request_source(
                 source,
                 "POST",
@@ -666,15 +563,13 @@ def search_source(
             obj = response.json()
 
             if not valid_response(obj):
-
                 errors.append(
                     f"Şema {schema}: "
-                    "cevap geldi ancak karar yapısı tanınmadı."
+                    "cevap geldi fakat karar yapısı tanınmadı."
                 )
-
                 continue
 
-            rt["schema"][source] = schema
+            state["schema"][source] = schema
 
             raw_rows = find_rows(obj)
 
@@ -698,11 +593,9 @@ def search_source(
             }
 
         except Exception as exc:
-
             errors.append(
                 f"Şema {schema}: "
-                f"{type(exc).__name__}: "
-                f"{exc}"
+                f"{type(exc).__name__}: {exc}"
             )
 
     return {
@@ -715,14 +608,11 @@ def search_source(
 
 
 # ============================================================
-# KARAR METNİNİ ÇEK
+# KARAR METNİ
 # ============================================================
 
 def extract_decision_text(raw):
-
-    raw = html.unescape(
-        raw or ""
-    )
+    raw = html.unescape(raw or "")
 
     soup = BeautifulSoup(
         raw,
@@ -740,9 +630,7 @@ def extract_decision_text(raw):
 
     candidates = []
 
-    # Büyük metin bloklarını ara.
     for tag in soup.find_all(True):
-
         text = tag.get_text(
             "\n",
             strip=True,
@@ -759,16 +647,9 @@ def extract_decision_text(raw):
     if whole:
         candidates.append(whole)
 
-    # Escape edilmiş ikinci HTML katmanı olabilir.
-    decoded = html.unescape(
-        whole
-    )
+    decoded = html.unescape(whole)
 
-    if (
-        "<" in decoded
-        and ">" in decoded
-    ):
-
+    if "<" in decoded and ">" in decoded:
         soup2 = BeautifulSoup(
             decoded,
             "html.parser",
@@ -783,7 +664,6 @@ def extract_decision_text(raw):
             candidates.append(nested)
 
     if not candidates:
-
         plain = re.sub(
             r"<br\s*/?>",
             "\n",
@@ -801,22 +681,20 @@ def extract_decision_text(raw):
             html.unescape(plain)
         )
 
-    # Genellikle en uzun blok kararın tam metnidir.
     text = max(
         candidates,
         key=len,
     )
 
-    junk = [
+    junk = {
         "SUCCESS",
         "ADALET_SUCCESS",
         "İşlem başarıyla gerçekleştirildi!",
-    ]
+    }
 
     lines = []
 
     for line in text.splitlines():
-
         line = re.sub(
             r"[ \t]+",
             " ",
@@ -843,7 +721,6 @@ def get_decision_text(
     decision_id,
     query,
 ):
-
     if not decision_id:
         return ""
 
@@ -861,7 +738,6 @@ def get_decision_text(
     )
 
     try:
-
         response = request_source(
             source,
             "GET",
@@ -873,36 +749,31 @@ def get_decision_text(
         )[:500000]
 
     except Exception:
-
         return ""
 
 
 # ============================================================
-# ARAMA KELİMESİNİ VURGULA
+# VURGULAMA
 # ============================================================
 
 def highlight_terms(query):
-
     query = clean(query)
 
     if not query:
         return []
 
-    # "haksız tahrik" -> tek ifade
     quoted = re.findall(
         r'"([^"]+)"',
         query,
     )
 
     if quoted:
-
         return [
             clean(x)
             for x in quoted
             if clean(x)
         ]
 
-    # haksız tahrik -> iki kelime
     return re.findall(
         r"[0-9A-Za-zÇĞİÖŞÜçğıöşü]+",
         query,
@@ -913,30 +784,21 @@ def highlight_html(
     decision_text,
     query,
 ):
-
     safe_text = html.escape(
         decision_text
     )
 
-    terms = highlight_terms(
-        query
-    )
-
+    terms = highlight_terms(query)
     terms.sort(
         key=len,
         reverse=True,
     )
 
     for term in terms:
-
-        escaped_term = html.escape(
-            term
-        )
+        escaped = html.escape(term)
 
         pattern = re.compile(
-            re.escape(
-                escaped_term
-            ),
+            re.escape(escaped),
             flags=re.I,
         )
 
@@ -952,7 +814,7 @@ def highlight_html(
 
     safe_text = safe_text.replace(
         "\n",
-        "<br>"
+        "<br>",
     )
 
     return f"""
@@ -963,7 +825,7 @@ def highlight_html(
 
 
 # ============================================================
-# WORD OLUŞTUR
+# WORD
 # ============================================================
 
 def make_word(
@@ -972,11 +834,9 @@ def make_word(
     decision_text,
     query,
 ):
-
     doc = Document()
 
     normal = doc.styles["Normal"]
-
     normal.font.name = "Arial"
     normal.font.size = Pt(11)
 
@@ -986,27 +846,23 @@ def make_word(
     )
 
     doc.add_paragraph(
-        f"Daire / Kurul: "
-        f"{row.get('daire') or '-'}"
+        f"Daire / Kurul: {row.get('daire') or '-'}"
     )
 
     doc.add_paragraph(
-        f"Esas No: "
-        f"{row.get('esas') or '-'}"
+        f"Esas No: {row.get('esas') or '-'}"
     )
 
     doc.add_paragraph(
-        f"Karar No: "
-        f"{row.get('karar') or '-'}"
+        f"Karar No: {row.get('karar') or '-'}"
     )
 
     doc.add_paragraph(
-        f"Karar Tarihi: "
-        f"{row.get('tarih') or '-'}"
+        f"Karar Tarihi: {row.get('tarih') or '-'}"
     )
 
     doc.add_paragraph(
-        f"Arama: {query}"
+        f"Arama: {query or '-'}"
     )
 
     doc.add_heading(
@@ -1018,7 +874,6 @@ def make_word(
         r"\n{2,}",
         decision_text,
     ):
-
         paragraph = paragraph.strip()
 
         if paragraph:
@@ -1027,17 +882,12 @@ def make_word(
             )
 
     buffer = io.BytesIO()
-
     doc.save(buffer)
 
     return buffer.getvalue()
 
 
-def word_name(
-    source,
-    row,
-):
-
+def word_name(source, row):
     source_name = (
         "Yargitay"
         if source == "Yargıtay"
@@ -1047,18 +897,12 @@ def word_name(
     esas = (
         row.get("esas")
         or "Esas"
-    ).replace(
-        "/",
-        "_",
-    )
+    ).replace("/", "_")
 
     karar = (
         row.get("karar")
         or "Karar"
-    ).replace(
-        "/",
-        "_",
-    )
+    ).replace("/", "_")
 
     return (
         f"{source_name}_"
@@ -1084,31 +928,20 @@ st.markdown(
     font-family: Georgia, "Times New Roman", serif;
     font-size: 17px;
     line-height: 1.72;
-
     height: 650px;
     overflow-y: auto;
-
     padding: 25px;
-
     border: 1px solid rgba(130,130,130,.3);
     border-radius: 12px;
-
     background: rgba(128,128,128,.035);
 }
 
 .aranan {
     background-color: #ffd900;
     color: #111;
-
     font-weight: 600;
-
-    text-decoration:
-        underline
-        2px
-        #d18e00;
-
+    text-decoration: underline 2px #d18e00;
     text-underline-offset: 3px;
-
     padding: 0 2px;
 }
 
@@ -1128,9 +961,7 @@ div[data-testid="stMetric"] {
 # ARAYÜZ
 # ============================================================
 
-st.title(
-    "⚖️ Yargı Kararı Bulucu"
-)
+st.title("⚖️ Yargı Kararı Bulucu")
 
 st.caption(
     "Yargıtay ve UYAP Emsal kararlarında "
@@ -1138,16 +969,11 @@ st.caption(
 )
 
 
-# ------------------------------------------------------------
-# ARAMA KUTUSU
-# ------------------------------------------------------------
-
 search_left, search_right = st.columns(
     [7, 1]
 )
 
 with search_left:
-
     query = st.text_input(
         "Arama",
         placeholder=(
@@ -1159,7 +985,6 @@ with search_left:
     )
 
 with search_right:
-
     search_button = st.button(
         "🔎 Ara",
         type="primary",
@@ -1167,26 +992,13 @@ with search_right:
     )
 
 
-# ------------------------------------------------------------
-# DETAYLI ARAMA
-# ------------------------------------------------------------
-
-with st.expander(
-    "🔍 Detaylı Arama"
-):
-
-    col1, col2, col3 = st.columns(
-        3
-    )
+with st.expander("🔍 Detaylı Arama"):
+    col1, col2, col3 = st.columns(3)
 
     with col1:
-
         chamber = st.text_input(
             "Daire / Kurul",
-            placeholder=(
-                "Örn: "
-                "1. Ceza Dairesi"
-            ),
+            placeholder="Örn: 1. Ceza Dairesi",
         )
 
         esas_year = st.text_input(
@@ -1199,7 +1011,6 @@ with st.expander(
         )
 
     with col2:
-
         start_date = st.text_input(
             "Başlangıç tarihi",
             placeholder="GG.AA.YYYY",
@@ -1215,7 +1026,6 @@ with st.expander(
         )
 
     with col3:
-
         end_date = st.text_input(
             "Bitiş tarihi",
             placeholder="GG.AA.YYYY",
@@ -1235,20 +1045,15 @@ with st.expander(
 # ============================================================
 
 if "active_search" not in st.session_state:
-
     st.session_state.active_search = None
 
-
 if "pages" not in st.session_state:
-
     st.session_state.pages = {
         "Yargıtay": 1,
         "UYAP Emsal": 1,
     }
 
-
 if "selected" not in st.session_state:
-
     st.session_state.selected = {}
 
 
@@ -1257,20 +1062,14 @@ if "selected" not in st.session_state:
 # ============================================================
 
 if search_button:
-
     st.session_state.active_search = {
-
         "query": query,
-
         "chamber": chamber,
-
         "start_date": start_date,
         "end_date": end_date,
-
         "esas_year": esas_year,
         "esas_first": esas_first,
         "esas_last": esas_last,
-
         "karar_year": karar_year,
         "karar_first": karar_first,
         "karar_last": karar_last,
@@ -1290,96 +1089,124 @@ active = st.session_state.active_search
 
 
 # ============================================================
-# SONUÇLAR
+# ARAMA SONUÇLARI
 # ============================================================
 
 if active:
-
     if not any(
         clean(value)
-        for value
-        in active.values()
+        for value in active.values()
     ):
-
         st.warning(
             "Bir arama kriteri gir."
         )
-
         st.stop()
-
 
     PAGE_SIZE = 10
 
-
     # --------------------------------------------------------
-    # YARGITAY VE UYAP PARALEL ARANIR
+    # KRİTİK DÜZELTME:
+    # session_state worker thread içinde kullanılmıyor.
     # --------------------------------------------------------
 
-    def search_job(source):
+    page_numbers = {
+        "Yargıtay": int(
+            st.session_state.pages.get(
+                "Yargıtay",
+                1,
+            )
+        ),
+        "UYAP Emsal": int(
+            st.session_state.pages.get(
+                "UYAP Emsal",
+                1,
+            )
+        ),
+    }
 
-        result = search_source(
+    # active içeriğini de normal dict'e kopyala.
+    active_data = dict(active)
 
-            source,
+    def search_job(
+        source,
+        page_number,
+        active_copy,
+    ):
+        try:
+            result = search_source(
+                source,
+                active_copy["query"],
+                page_number,
+                PAGE_SIZE,
+                active_copy["chamber"],
+                active_copy["start_date"],
+                active_copy["end_date"],
+                active_copy["esas_year"],
+                active_copy["esas_first"],
+                active_copy["esas_last"],
+                active_copy["karar_year"],
+                active_copy["karar_first"],
+                active_copy["karar_last"],
+            )
 
-            active["query"],
+            return source, result
 
-            st.session_state.pages[
-                source
-            ],
-
-            PAGE_SIZE,
-
-            active["chamber"],
-
-            active["start_date"],
-            active["end_date"],
-
-            active["esas_year"],
-            active["esas_first"],
-            active["esas_last"],
-
-            active["karar_year"],
-            active["karar_first"],
-            active["karar_last"],
-        )
-
-        return source, result
-
+        except Exception as exc:
+            return source, {
+                "ok": False,
+                "rows": [],
+                "total": 0,
+                "schema": None,
+                "error": (
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                ),
+            }
 
     results = {}
-
 
     with st.spinner(
         "Yargıtay ve UYAP Emsal taranıyor..."
     ):
-
         with ThreadPoolExecutor(
             max_workers=2
         ) as executor:
 
             futures = [
-
                 executor.submit(
                     search_job,
                     source,
+                    page_numbers[source],
+                    active_data,
                 )
-
                 for source in [
                     "Yargıtay",
                     "UYAP Emsal",
                 ]
             ]
 
-
             for future in as_completed(
                 futures
             ):
+                try:
+                    source, result = (
+                        future.result()
+                    )
 
-                source, result = (
-                    future.result()
-                )
+                    results[source] = result
 
-                results[source] = result
+                except Exception as exc:
+                    # Worker'daki hata uygulamayı çökertmez.
+                    results["Bilinmeyen"] = {
+                        "ok": False,
+                        "rows": [],
+                        "total": 0,
+                        "schema": None,
+                        "error": (
+                            f"{type(exc).__name__}: "
+                            f"{exc}"
+                        ),
+                    }
 
 
     # ========================================================
@@ -1390,9 +1217,7 @@ if active:
         source,
         result,
     ):
-
         if not result["ok"]:
-
             st.error(
                 f"{source} sistemine "
                 "bu oturumda erişilemedi."
@@ -1401,7 +1226,6 @@ if active:
             with st.expander(
                 "Teknik ayrıntı"
             ):
-
                 st.code(
                     result["error"]
                     or
@@ -1410,21 +1234,13 @@ if active:
 
             return
 
-
         rows = result["rows"]
-
         total = result["total"]
-
-
-        # ----------------------------------------------------
-        # TOPLAM SONUÇ
-        # ----------------------------------------------------
 
         st.success(
             f"{total:,} adet karar bulundu."
             .replace(",", ".")
         )
-
 
         total_pages = max(
             1,
@@ -1436,20 +1252,13 @@ if active:
             // PAGE_SIZE
         )
 
-
-        # ----------------------------------------------------
-        # SAYFALAMA
-        # ----------------------------------------------------
-
         prev_col, page_col, next_col = (
             st.columns(
                 [1, 2.2, 1]
             )
         )
 
-
         with prev_col:
-
             if st.button(
                 "◀ Önceki",
                 key=f"prev_{source}",
@@ -1460,7 +1269,6 @@ if active:
                 ),
                 use_container_width=True,
             ):
-
                 st.session_state.pages[
                     source
                 ] -= 1
@@ -1472,28 +1280,19 @@ if active:
 
                 st.rerun()
 
-
         with page_col:
-
             selected_page = st.number_input(
-
                 "Sayfa",
-
                 min_value=1,
-
                 max_value=total_pages,
-
                 value=min(
                     st.session_state
                     .pages[source],
                     total_pages,
                 ),
-
                 step=1,
-
                 key=f"page_{source}",
             )
-
 
             if (
                 int(selected_page)
@@ -1501,7 +1300,6 @@ if active:
                 st.session_state
                 .pages[source]
             ):
-
                 st.session_state.pages[
                     source
                 ] = int(
@@ -1515,9 +1313,7 @@ if active:
 
                 st.rerun()
 
-
             st.caption(
-
                 (
                     f"Sayfa "
                     f"{st.session_state.pages[source]:,}"
@@ -1527,9 +1323,7 @@ if active:
                 .replace(",", ".")
             )
 
-
         with next_col:
-
             if st.button(
                 "Sonraki ▶",
                 key=f"next_{source}",
@@ -1540,7 +1334,6 @@ if active:
                 ),
                 use_container_width=True,
             ):
-
                 st.session_state.pages[
                     source
                 ] += 1
@@ -1552,17 +1345,11 @@ if active:
 
                 st.rerun()
 
-
-        # ----------------------------------------------------
-        # İLK KARAR OTOMATİK AÇILSIN
-        # ----------------------------------------------------
-
         if (
             rows
             and source
             not in st.session_state.selected
         ):
-
             first_with_id = next(
                 (
                     row
@@ -1573,39 +1360,24 @@ if active:
             )
 
             if first_with_id:
-
                 st.session_state.selected[
                     source
                 ] = first_with_id
-
-
-        # ----------------------------------------------------
-        # SOL LİSTE / SAĞ ÖNİZLEME
-        # ----------------------------------------------------
 
         left, right = st.columns(
             [0.45, 0.55],
             gap="large",
         )
 
-
-        # ====================================================
-        # SOL TARAF
-        # ====================================================
-
         with left:
-
             st.markdown(
                 "### Karar Listesi"
             )
 
-
             if not rows:
-
                 st.info(
                     "Bu sayfada karar bulunamadı."
                 )
-
 
             first_number = (
                 (
@@ -1616,93 +1388,67 @@ if active:
                 * PAGE_SIZE
             )
 
-
             for index, row in enumerate(
                 rows,
                 start=1,
             ):
-
                 current = (
                     st.session_state
                     .selected.get(source)
                 )
 
-                selected = (
+                is_selected = (
                     current
                     and current.get("id")
                     == row.get("id")
                 )
 
-
                 with st.container(
                     border=True
                 ):
-
                     st.markdown(
-
                         f"**"
                         f"{first_number + index}. "
                         f"{row['daire'] or source}"
                         f"**"
-
                         f"  \n"
-
-                        f"E. "
-                        f"**{row['esas'] or '—'}**"
-
+                        f"E. **{row['esas'] or '—'}**"
                         f" · "
-
-                        f"K. "
-                        f"**{row['karar'] or '—'}**"
-
+                        f"K. **{row['karar'] or '—'}**"
                         f"  \n"
-
                         f"{row['tarih'] or '—'}"
                     )
 
-
                     if st.button(
-
                         (
                             "✓ Açık"
-                            if selected
+                            if is_selected
                             else
                             "📄 Önizle"
                         ),
-
                         key=(
                             f"{source}_"
                             f"{st.session_state.pages[source]}_"
                             f"{index}_"
                             f"{row.get('id')}"
                         ),
-
                         disabled=(
                             not bool(
                                 row.get("id")
                             )
                         ),
-
                         use_container_width=True,
                     ):
-
                         st.session_state.selected[
                             source
                         ] = row
 
                         st.rerun()
 
-
-        # ====================================================
-        # SAĞ TARAF
-        # ====================================================
-
         with right:
-
             st.markdown(
                 "### Karar Önizleme"
             )
-
 
             selected_row = (
                 st.session_state
@@ -1710,113 +1456,67 @@ if active:
                 .get(source)
             )
 
-
             if not selected_row:
-
                 st.info(
                     "Soldaki listeden "
                     "bir karar seç."
                 )
-
                 return
-
 
             with st.spinner(
                 "Karar metni yükleniyor..."
             ):
-
                 decision_text = (
                     get_decision_text(
-
                         source,
-
-                        selected_row[
-                            "id"
-                        ],
-
-                        active[
-                            "query"
-                        ],
+                        selected_row["id"],
+                        active_data["query"],
                     )
                 )
 
-
             if not decision_text:
-
                 st.warning(
                     "Karar listede bulundu ancak "
                     "tam metni bu istekte alınamadı."
                 )
-
                 return
 
-
-            # ------------------------------------------------
-            # BAŞLIK
-            # ------------------------------------------------
-
             st.markdown(
-
                 f"### "
                 f"{selected_row['daire'] or source}"
-
             )
 
-
             st.markdown(
-
                 f"**Esas:** "
                 f"{selected_row['esas'] or '—'}"
-
                 f" &nbsp;&nbsp; "
-
                 f"**Karar:** "
                 f"{selected_row['karar'] or '—'}"
-
                 f" &nbsp;&nbsp; "
-
                 f"**Tarih:** "
                 f"{selected_row['tarih'] or '—'}"
-
             )
-
-
-            # ------------------------------------------------
-            # VURGULANMIŞ OKUMA EKRANI
-            # ------------------------------------------------
 
             st.markdown(
-
                 highlight_html(
                     decision_text,
-                    active["query"],
+                    active_data["query"],
                 ),
-
                 unsafe_allow_html=True,
             )
-
-
-            # ------------------------------------------------
-            # KOPYALANABİLİR TAM METİN
-            # ------------------------------------------------
 
             with st.expander(
                 "📋 Kararı kopyala"
             ):
-
                 st.caption(
                     "Kutunun içine tıkla → "
                     "Ctrl+A → Ctrl+C"
                 )
 
                 st.text_area(
-
                     "Tam karar metni",
-
                     value=decision_text,
-
                     height=450,
-
                     key=(
                         f"copy_"
                         f"{source}_"
@@ -1824,51 +1524,31 @@ if active:
                     ),
                 )
 
-
-            # ------------------------------------------------
-            # WORD
-            # ------------------------------------------------
-
             word_bytes = make_word(
-
                 source,
-
                 selected_row,
-
                 decision_text,
-
-                active["query"],
+                active_data["query"],
             )
-
 
             download1, download2 = (
                 st.columns(2)
             )
 
-
             with download1:
-
                 st.download_button(
-
                     "⬇️ Word Olarak İndir",
-
                     data=word_bytes,
-
                     file_name=word_name(
                         source,
                         selected_row,
                     ),
-
                     mime=(
                         "application/"
-                        "vnd.openxmlformats-"
-                        "officedocument."
-                        "wordprocessingml."
-                        "document"
+                        "vnd.openxmlformats-officedocument."
+                        "wordprocessingml.document"
                     ),
-
                     use_container_width=True,
-
                     key=(
                         f"word_"
                         f"{source}_"
@@ -1876,26 +1556,16 @@ if active:
                     ),
                 )
 
-
             with download2:
-
                 st.download_button(
-
                     "⬇️ TXT Olarak İndir",
-
                     data=(
                         decision_text
                         .encode("utf-8")
                     ),
-
-                    file_name=(
-                        "yargi_karari.txt"
-                    ),
-
+                    file_name="yargi_karari.txt",
                     mime="text/plain",
-
                     use_container_width=True,
-
                     key=(
                         f"txt_"
                         f"{source}_"
@@ -1916,57 +1586,38 @@ if active:
         ])
     )
 
-
     with tab_yargitay:
-
         render_source(
-
             "Yargıtay",
-
             results.get(
                 "Yargıtay",
                 {
                     "ok": False,
                     "rows": [],
                     "total": 0,
-                    "error": (
-                        "Sonuç alınamadı."
-                    ),
+                    "error": "Sonuç alınamadı.",
                 },
             ),
         )
 
-
     with tab_uyap:
-
         render_source(
-
             "UYAP Emsal",
-
             results.get(
                 "UYAP Emsal",
                 {
                     "ok": False,
                     "rows": [],
                     "total": 0,
-                    "error": (
-                        "Sonuç alınamadı."
-                    ),
+                    "error": "Sonuç alınamadı.",
                 },
             ),
         )
 
-
-    # ========================================================
-    # BİRLEŞİK GÖRÜNÜM
-    # ========================================================
-
     with tab_all:
-
         st.markdown(
             "### Kaynak Özeti"
         )
-
 
         yargitay = results.get(
             "Yargıtay",
@@ -1978,14 +1629,10 @@ if active:
             {}
         )
 
-
         col_y, col_u = st.columns(2)
 
-
         with col_y:
-
             if yargitay.get("ok"):
-
                 st.metric(
                     "Yargıtay",
                     (
@@ -1993,18 +1640,13 @@ if active:
                         .replace(",", ".")
                     ),
                 )
-
             else:
-
                 st.error(
                     "Yargıtay bağlantısı kurulamadı."
                 )
 
-
         with col_u:
-
             if uyap.get("ok"):
-
                 st.metric(
                     "UYAP Emsal",
                     (
@@ -2012,73 +1654,43 @@ if active:
                         .replace(",", ".")
                     ),
                 )
-
             else:
-
                 st.error(
                     "UYAP Emsal bağlantısı kurulamadı."
                 )
 
 
-        st.info(
-            "Birleşik karar listesi, "
-            "aynı kararların tekilleştirilmesi, "
-            "benzer karar analizi ve "
-            "karar karşılaştırması "
-            "bir sonraki aşamada buraya eklenebilir."
-        )
-
-
 # ============================================================
-# AÇIKLAMA
+# BİLGİ
 # ============================================================
 
 with st.expander(
     "ℹ️ Arama nasıl çalışır?"
 ):
-
     st.markdown(
         """
 ### Tırnaksız arama
 
 `haksız tahrik`
 
-ifadesi resmî sisteme tırnaksız gönderilir.
-
-Bu nedenle sistem geniş kelime araması yapabilir.
+resmî sisteme tırnaksız gönderilir.
 
 ### Tırnaklı arama
 
 `"haksız tahrik"`
 
-ifadesindeki tırnak işaretleri korunur ve resmî sisteme aynen gönderilir.
+tırnak işaretleri korunarak resmî sisteme gönderilir.
 
-### Sonuçlar
+### Hız
 
-Binlerce kararın tamamı aynı anda indirilmez.
+Binlerce kararın tam metni aynı anda indirilmez.
 
-Örneğin **80.441 karar** bulunursa toplam sayı gösterilir ve kararlar **10'ar kayıt halinde sayfalanır**.
-
-Bu yöntem uygulamanın daha hızlı çalışmasını sağlar.
-
-### Karar metni
-
-Sadece seçtiğin kararın tam metni yüklenir.
-
-Bu nedenle her aramada 10 kararın tam metni aynı anda indirilmez.
+Önce karar listesi alınır. Sadece seçtiğin kararın tam metni yüklenir.
 
 ### Vurgulama
 
-Tırnaksız:
+`haksız tahrik` aramasında **haksız** ve **tahrik** ayrı ayrı vurgulanır.
 
-`haksız tahrik`
-
-aramasında **haksız** ve **tahrik** ayrı ayrı vurgulanır.
-
-Tırnaklı:
-
-`"haksız tahrik"`
-
-aramasında **haksız tahrik** ifadesi birlikte vurgulanır.
+`"haksız tahrik"` aramasında **haksız tahrik** ifadesi birlikte vurgulanır.
 """
     )
